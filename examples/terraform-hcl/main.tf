@@ -1,0 +1,11 @@
+terraform {
+  required_version = ">= 1.0"
+}
+
+locals {
+  example_name = "local-only"
+}
+
+output "example_name" {
+  value = local.example_name
+}
