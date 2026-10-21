@@ -8,7 +8,7 @@ from devops_copilot import __version__
 setup(
     name="devops-copilot",
     version=__version__,
-    description="Safe, read-only DevOps project diagnostics",
+    description="Safe, read-only DevOps project and workflow diagnostics",
     packages=find_packages(exclude=("tests", "tests.*")),
     py_modules=["main"],
     python_requires=">=3.9",

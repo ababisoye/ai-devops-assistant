@@ -13,20 +13,55 @@ are reliable and their privacy, cost, and operational impact are understood.
    installation and usage documentation.
 2. **Local DevOps diagnostics — complete.** Detect common tools and project files; improve
    Git and Terraform checks without exposing secrets or changing infrastructure.
-3. **Terraform troubleshooting — current stage.** Explain likely configuration issues and
+3. **Terraform troubleshooting — complete for the current narrow checks.** Explain likely configuration issues and
    safe validation results, distinguishing evidence from suggestions.
-4. **AI integration.** Compare local and hosted options, then add a modular
-   provider only after privacy and cost trade-offs are approved.
-5. **GitHub and CI/CD assistance.** Inspect workflow configuration and explain
-   failures using safe, read-only integrations.
-6. **AWS diagnostics and cost awareness.** Add least-privilege read-only
-   checks only when justified; never change cloud resources autonomously.
-7. **Docker and Kubernetes assistance.** Add local validation and read-only
-   diagnosis before considering changes to live workloads.
+4. **AI integration — local Ollama Q&A and safe Terraform explanations
+   implemented.** Hosted providers and project-context explanations beyond the
+   supported static findings remain future work.
+5. **GitHub and CI/CD assistance — initial local workflow check implemented.**
+   The first check flags a top-level `permissions: write-all` line; YAML
+   validation, job-level permissions, other workflow diagnostics, and failure
+   explanations remain future work.
+6. **AWS diagnostics and cost awareness — initial read-only security group and
+   local RDS configuration checks implemented.** Broader diagnostics and cost
+   awareness remain future work; never change cloud resources autonomously.
+7. **Docker and Kubernetes assistance — initial Dockerfile check implemented.**
+   The local check flags implicit or explicit `latest` base-image tags;
+   broader Docker and Kubernetes diagnostics remain future work.
 8. **Product development.** Evaluate packaging, reports, APIs, dashboards, and
    team features based on demonstrated usefulness and operating cost.
 
 ## Milestones
+
+- **Completed:** Added `project-review` to run Terraform static analysis,
+  GitHub Actions permission checks, and Dockerfile base-image checks together.
+  Each check runs locally and the command continues after individual failures.
+- **Completed:** Terraform analysis flags literal
+  `aws_db_instance.publicly_accessible = true` in HCL and JSON, marks dynamic
+  values incomplete, and gives source locations. It notes that network
+  reachability depends on subnet routing and security-group rules; no AWS state
+  is queried.
+- **Completed:** Terraform analysis flags explicit
+  `aws_db_instance.storage_encrypted = false` in HCL and JSON, marks dynamic
+  values incomplete, and gives source locations. It notes the provider's
+  cross-region read-replica exception and makes no claim about deployed state.
+- **Completed:** Terraform analysis reports explicit
+  `aws_db_instance.deletion_protection = false` in HCL and JSON, marks dynamic
+  values incomplete, and notes that AWS permissions are still required to
+  delete an instance. No live settings are queried.
+- **Completed:** Terraform analysis reports explicit
+  `aws_db_instance.skip_final_snapshot = true` in HCL and JSON, marks dynamic
+  values incomplete, and explains that a future Terraform deletion would not
+  request a final snapshot. It does not assess other backups or perform deletes.
+- **Completed:** Terraform analysis reports
+  `aws_db_instance.backup_retention_period = 0` in HCL and JSON, marks dynamic
+  values incomplete, and explains that this disables RDS automated backups
+  where the setting applies. AWS Backup plans and other snapshots are not
+  inspected.
+- **Completed:** Terraform analysis flags explicitly suspended or disabled
+  S3 versioning in current and legacy Terraform resource forms. HCL/JSON tests
+  cover literal and dynamic values; reports include source lines where
+  available and do not claim to inspect live buckets.
 
 - **Completed:** Initial CLI implementation with `inspect`, `terraform`, and
   `git-status`; standard-library-only runtime; basic usage documentation and
@@ -98,6 +133,25 @@ are reliable and their privacy, cost, and operational impact are understood.
   Known protocols and ports are summarized safely; unresolved values are not
   printed, and unresolved CIDRs produce an incomplete result. The real optional
   parser was verified; all 46 tests pass, including parser-backed HCL tests.
+- **Completed:** Terraform analysis flags literal public S3 canned ACLs and
+  explicitly false bucket-level S3 Block Public Access settings in HCL and
+  JSON. Dynamic values are marked incomplete. Findings do not establish
+  effective access; account and organization settings are not inspected.
+- **Completed:** Terraform analysis flags literal `encrypted = false` on
+  `aws_ebs_volume` resources and `aws_instance` root/additional EBS device
+  blocks and `aws_launch_template` EBS mappings in HCL and JSON. Account-level
+  encryption defaults may override the declaration; live volumes are not
+  checked.
+- **Completed:** Terraform analysis flags explicit token-optional metadata
+  settings in `aws_instance` and `aws_launch_template` resources. Dynamic
+  values are incomplete; account settings, launch overrides, and live behavior
+  are not checked.
+- **Completed:** Static findings include filenames and parser-derived HCL line
+  numbers where supported. Terraform JSON findings include matching source line
+  numbers. Sensitive filenames remain suppressed.
+- **Completed:** Terraform static analysis includes local nested modules and
+  reports paths relative to the selected directory. Hidden, sensitive,
+  generated, and symlinked paths remain excluded; regression tests verify this.
 - **Completed:** Added a `required_version` advisory. Detection handles HCL,
   compact JSON, and line comments without echoing file contents; tests cover
   present, absent, unreadable, and commented-out declarations.
@@ -114,6 +168,45 @@ are reliable and their privacy, cost, and operational impact are understood.
   continues to use the standard library.
 - **Stage 2 complete:** Local tool availability, project overview, Git status,
   and safe Terraform formatting/validation checks are implemented.
+- **Completed:** Added `aws-security-groups`, which calls the AWS CLI's
+  read-only `DescribeSecurityGroupRules` operation and reports internet-wide
+  inbound IPv4/IPv6 rules. It suppresses raw AWS diagnostics and does not print
+  group IDs or descriptions. Regression tests use mocked responses; no live AWS
+  account was queried during implementation.
+- **Completed:** Added `ask` using Ollama's local chat endpoint and Python's
+  standard library. It sends only the question to localhost, caps context and
+  answer length, and keeps working diagnostics available when Ollama is absent.
+  Tests use a mocked local response; no model was installed or invoked.
+- **Completed:** Added `terraform-explain`, which feeds a local model only
+  allowlisted summaries from the existing Terraform static checks. Filenames,
+  resource labels, configuration values, and unresolved CIDRs are excluded.
+  Analysis errors skip the model request. Regression tests verify the filtering
+  and error path; a live model response still needs verification from the user's
+  Terminal because this execution environment blocks localhost access.
+- **Completed:** Added `terraform-draft`, which asks a local model for a small
+  Terraform HCL draft from typed requirements and prints it for review. Optional
+  `--output` saves to a new `.tf` file and refuses to overwrite an existing
+  target. It does not inspect project files or format, validate, or apply code.
+  Offline tests verify input bounds and prompt settings; the user confirmed the
+  command returns a draft using local Ollama. The generated HCL still requires
+  human review and Terraform validation before use.
+- **Updated:** Terraform drafts now ask the model to comment each top-level
+  block in beginner-friendly language. Automated tests verify the prompt
+  instruction; whether a live model follows it depends on its output.
+- **Updated:** Added safe opt-in saving with `--output`; tests verify new-file
+  creation and that existing files remain unchanged.
+- **Completed:** Added `terraform-review`, a one-command workflow for existing
+  local formatting, initialized-directory validation, and static analysis. It
+  makes no AWS or AI calls and does not modify files or infrastructure.
+- **Updated:** `terraform-review --explain` can optionally ask local Ollama to
+  explain supported findings. It reuses the allowlisted context sanitizer, and
+  the default command remains AI-free. Tests verify filename exclusion and
+  skipped AI on incomplete analysis; live model behavior awaits a user run.
+- **Completed:** Terraform analysis flags explicit `public-read` and
+  `public-read-write` canned ACLs in common S3 bucket/object resources in HCL
+  and JSON. Dynamic values are marked unresolved. Static findings explain that
+  Block Public Access can override them; bucket policies and grant blocks are
+  not covered.
 - **Design note:** Keep the current narrow Terraform hint standard-library
   only. HCL supports nested syntax and single-line and multiline comments; a
   full parser would reduce false positives for richer rules. Revisit a parser
@@ -123,9 +216,13 @@ are reliable and their privacy, cost, and operational impact are understood.
 
 ## Current project state
 
-The checkout does not contain a `.git` directory, so repository history and
-working-tree status could not be inspected here. Packaging metadata now supports
+The checkout contains Git metadata and the working tree can be inspected.
+Packaging metadata now supports
 a base installation, console entry point, and optional Terraform parser extra.
 The base CLI and regression suite run on Python 3.9.6. The optional
 `python-hcl2` 8.1.4 parser is installed in the project virtual environment and
-verified with the HCL analysis tests.
+verified with the HCL analysis tests. The new AWS command requires an installed
+AWS CLI and `ec2:DescribeSecurityGroupRules` on the configured identity; no
+additional Python dependency was added. AI question answering requires an
+optional Ollama installation and a downloaded model; no hosted API or AI
+subscription is used.

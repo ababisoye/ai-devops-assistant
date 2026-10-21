@@ -1,28 +1,28 @@
 # Current Task
 
-## Next task: review Terraform ingress findings on a representative module
+## Current task: local S3 versioning check — complete
 
-The read-only public-ingress rule now analyzes common AWS security group
-resources in Terraform JSON and HCL. Known protocol and port details are
-summarized safely. Dynamic or malformed ingress CIDRs produce an incomplete
-result instead of a clean claim, and their values are not printed.
-
-The optional parser (`python-hcl2` 8.1.4) is installed in the project virtual
-environment. The one-command test script runs the regression suite and both
-included Terraform examples. All 46 tests passed, including tests using the
-real parser.
+Terraform analysis now reports explicitly suspended or disabled S3 versioning
+in both the current `aws_s3_bucket_versioning` resource and legacy bucket
+versioning blocks. Dynamic values are marked incomplete, findings include
+source lines, and AI receives only a sanitized summary. The full suite (113
+tests), installed example reviews, and `git diff --check` pass.
 
 ### Acceptance criteria
 
-- Try `terraform-analyze` on a representative local Terraform module.
-- Check that findings are useful and do not disclose labels or configuration
-  values.
-- Record false positives, missing cases, or confusing wording before adding
-  more security rules.
+- Keep AWS checks local/read-only unless specific service access is authorized.
+- Do not claim a configuration setting proves live reachability or state.
+- Preserve HCL/JSON parity and sanitized explanations.
+
+### Verification results
+
+- HCL and Terraform JSON tests pass, including dynamic-value suppression.
+- `./test.sh`: 113 tests passed.
+- Installed `project-review` passed for `examples/terraform-json` and
+  `examples/terraform-hcl`.
+- `git diff --check` passed.
 
 ### Next actionable step
 
-Run `./test.sh` from the project directory for a quick local check. To analyze
-another module, run `venv/bin/python main.py terraform-analyze /path/to/module`
-from the project directory, replacing the path with the module's folder. This
-is local static analysis; it does not contact AWS or change infrastructure.
+Continue Stage 6 with another conservative, local Terraform AWS diagnostic;
+keep account access and live-state claims out of static checks.
