@@ -2,12 +2,14 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import patch
+from urllib.error import URLError
+from unittest.mock import MagicMock, patch
 
 from devops_copilot import cli
 
@@ -25,7 +27,7 @@ class CliTests(unittest.TestCase):
         with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
             cli.main(["--help"])
         self.assertEqual(raised.exception.code, 0)
-        for command in ("inspect", "status", "check", "terraform", "terraform-analyze", "git-status"):
+        for command in ("inspect", "status", "check", "terraform", "terraform-analyze", "terraform-review", "terraform-explain", "terraform-draft", "aws-security-groups", "ask", "git-status", "github-actions-check", "dockerfile-check", "project-review"):
             self.assertIn(command, stdout.getvalue())
 
     def test_version_flag_reports_package_version(self):
@@ -42,7 +44,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
 
     def test_directory_commands_default_to_current_directory(self):
-        for command in ("inspect", "status", "terraform", "terraform-analyze", "git-status"):
+        for command in ("inspect", "status", "terraform", "terraform-analyze", "terraform-review", "terraform-explain", "git-status", "github-actions-check", "dockerfile-check", "project-review"):
             with self.subTest(command=command):
                 args = cli.build_parser().parse_args([command])
                 self.assertEqual(args.directory, ".")
@@ -155,6 +157,91 @@ class CliTests(unittest.TestCase):
         self.assertIn("does not exist", stderr)
         which.assert_not_called()
 
+    def test_terraform_review_runs_analysis_even_if_tool_checks_fail(self):
+        with patch.object(cli, "terraform_check", return_value=1) as check, \
+                patch.object(cli, "terraform_analyze", return_value=0) as analyze:
+            code, stdout, stderr = self.run_captured(cli.terraform_review, "/terraform/module")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "")
+        self.assertIn("formatting and validation checks", stdout)
+        self.assertIn("static analysis", stdout)
+        check.assert_called_once_with("/terraform/module")
+        analyze.assert_called_once_with("/terraform/module")
+
+    def test_terraform_review_stops_after_invalid_directory(self):
+        with patch.object(cli, "terraform_check", return_value=2) as check, \
+                patch.object(cli, "terraform_analyze") as analyze:
+            code, _, _ = self.run_captured(cli.terraform_review, "/missing")
+
+        self.assertEqual(code, 2)
+        check.assert_called_once_with("/missing")
+        analyze.assert_not_called()
+
+    def test_terraform_review_returns_failure_if_analysis_fails(self):
+        with patch.object(cli, "terraform_check", return_value=0), \
+                patch.object(cli, "terraform_analyze", return_value=1):
+            code, stdout, _ = self.run_captured(cli.terraform_review, "/terraform/module")
+
+        self.assertEqual(code, 1)
+        self.assertNotIn("Review finished", stdout)
+
+    def test_terraform_review_reports_completion_when_checks_succeed(self):
+        with patch.object(cli, "terraform_check", return_value=0), \
+                patch.object(cli, "terraform_analyze", return_value=0):
+            code, stdout, _ = self.run_captured(cli.terraform_review, "/terraform/module")
+
+        self.assertEqual(code, 0)
+        self.assertIn("Review finished", stdout)
+
+    def test_terraform_review_explains_only_sanitized_findings_when_requested(self):
+        analyzer_report = (
+            "Potential public ingress: private-user-network.tf contains an "
+            "aws_security_group rule open to 0.0.0.0/0 "
+            "(protocol tcp, ports 22-22). Static analysis cannot confirm deployed exposure."
+        )
+        def report_analysis(_directory):
+            print(analyzer_report)
+            return 0
+
+        with patch.object(cli, "terraform_check", return_value=0), \
+                patch.object(cli, "terraform_analyze", side_effect=report_analysis), \
+                patch.object(cli, "ask_local_model", return_value=0) as ask:
+            code, stdout, stderr = self.run_captured(
+                cli.terraform_review, "/terraform/module", True, "llama3"
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("AI explanation", stdout)
+        ask.assert_called_once()
+        self.assertEqual(ask.call_args.args[1], "llama3")
+        context = ask.call_args.kwargs["context"]
+        self.assertIn("0.0.0.0/0", context)
+        self.assertIn("ports 22-22", context)
+        self.assertNotIn("private-user-network.tf", context)
+
+    def test_terraform_review_skips_ai_when_analysis_fails(self):
+        with patch.object(cli, "terraform_check", return_value=0), \
+                patch.object(cli, "terraform_analyze", return_value=1), \
+                patch.object(cli, "ask_local_model") as ask:
+            code, stdout, _ = self.run_captured(
+                cli.terraform_review, "/terraform/module", True, "llama3"
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("AI explanation skipped", stdout)
+        ask.assert_not_called()
+
+    def test_main_dispatches_terraform_review(self):
+        with patch.object(cli, "terraform_review", return_value=0) as review:
+            code = cli.main([
+                "terraform-review", "/terraform/module", "--explain", "--model", "llama3"
+            ])
+
+        self.assertEqual(code, 0)
+        review.assert_called_once_with("/terraform/module", True, "llama3")
+
     def test_terraform_reports_missing_tool(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(cli.shutil, "which", return_value=None):
             code, stdout, _ = self.run_captured(cli.terraform_check, temp_dir)
@@ -264,6 +351,31 @@ class CliTests(unittest.TestCase):
         self.assertIn("Terraform version constraint: found", stdout)
         self.assertNotIn(">= 1.5", stdout)
 
+    def test_terraform_analyze_includes_nested_modules_and_skips_generated_or_sensitive_dirs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            nested = root / "modules" / "network"
+            nested.mkdir(parents=True)
+            (nested / "main.tf.json").write_text(
+                '{"resource":{"aws_security_group":{"hidden_label":{'
+                '"ingress":[{"protocol":"tcp","from_port":443,"to_port":443,'
+                '"cidr_blocks":["0.0.0.0/0"]}]}}}}\n'
+            )
+            generated = root / ".terraform" / "modules"
+            generated.mkdir(parents=True)
+            (generated / "ignored.tf.json").write_text('{"provider":{}}\n')
+            secret = root / "secrets"
+            secret.mkdir()
+            (secret / "ignored.tf.json").write_text('{"provider":{}}\n')
+
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Terraform configuration files analyzed: 1/1", stdout)
+        self.assertIn("file: modules/network/main.tf.json", stdout)
+        self.assertNotIn("ignored.tf.json", stdout)
+        self.assertNotIn("hidden_label", stdout)
+
     def test_terraform_analyze_finds_public_ingress_in_supported_json_resources(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             (Path(temp_dir) / "main.tf.json").write_text(
@@ -292,6 +404,685 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("private_label", stdout)
         self.assertNotIn("another_private_label", stdout)
         self.assertNotIn("egress_label", stdout)
+
+    def test_terraform_analyze_flags_public_s3_acls_and_hides_expressions(self):
+        configuration = {
+            "resource": {
+                "aws_s3_bucket": {
+                    "public_read_bucket": {"acl": "public-read"},
+                    "private_bucket": {"acl": "private"},
+                    "dynamic_bucket": {"acl": "${var.sensitive_acl}"},
+                },
+                "aws_s3_bucket_acl": {
+                    "public_write_bucket": {"acl": "public-read-write"},
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "main.tf.json").write_text(json.dumps(configuration))
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("aws_s3_bucket uses public-read", stdout)
+        self.assertIn("aws_s3_bucket_acl uses public-read-write", stdout)
+        self.assertIn("S3 ACL check incomplete", stdout)
+        self.assertIn("Block Public Access settings may override it", stdout)
+        self.assertNotIn("public_read_bucket", stdout)
+        self.assertNotIn("public_write_bucket", stdout)
+        self.assertNotIn("sensitive_acl", stdout)
+
+    def test_terraform_analyze_flags_public_s3_acls_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "storage.tf").write_text(
+                'resource "aws_s3_bucket" "hidden_read_label" {\n'
+                '  acl = "public-read"\n'
+                '}\n'
+                'resource "aws_s3_bucket_acl" "hidden_write_label" {\n'
+                '  acl = "public-read-write"\n'
+                '}\n'
+                'resource "aws_s3_bucket" "private_label" {\n'
+                '  acl = "private"\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("aws_s3_bucket uses public-read", stdout)
+        self.assertIn("aws_s3_bucket_acl uses public-read-write", stdout)
+        self.assertIn("file: storage.tf, line: 2", stdout)
+        self.assertIn("file: storage.tf, line: 5", stdout)
+        self.assertNotIn("hidden_read_label", stdout)
+        self.assertNotIn("hidden_write_label", stdout)
+        self.assertNotIn("private_label", stdout)
+
+    def test_terraform_analyze_flags_explicitly_disabled_s3_public_access(self):
+        configuration = {
+            "resource": {
+                "aws_s3_bucket_public_access_block": {
+                    "private_label": {
+                        "block_public_acls": True,
+                        "block_public_policy": False,
+                        "ignore_public_acls": "${var.hidden_setting}",
+                    }
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "main.tf.json").write_text(json.dumps(configuration))
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("sets block_public_policy = false", stdout)
+        self.assertIn("S3 public-access block check incomplete", stdout)
+        self.assertIn("effective access were not checked", stdout)
+        self.assertNotIn("private_label", stdout)
+        self.assertNotIn("hidden_setting", stdout)
+
+    def test_terraform_analyze_flags_explicitly_disabled_s3_public_access_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "storage.tf").write_text(
+                'resource "aws_s3_bucket_public_access_block" "hidden_label" {\n'
+                '  block_public_acls       = true\n'
+                '  block_public_policy     = false\n'
+                '  ignore_public_acls      = true\n'
+                '  restrict_public_buckets = true\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("sets block_public_policy = false", stdout)
+        self.assertIn("file: storage.tf, line: 3", stdout)
+        self.assertNotIn("hidden_label", stdout)
+        self.assertNotIn("S3 public-access block check incomplete", stdout)
+
+    def test_terraform_analyze_flags_s3_versioning_not_enabled(self):
+        configuration = {
+            "resource": {
+                "aws_s3_bucket_versioning": {
+                    "hidden_label": {"versioning_configuration": [{"status": "Suspended"}]},
+                    "dynamic_label": {"versioning_configuration": [{"status": "${var.hidden_status}"}]},
+                },
+                "aws_s3_bucket": {
+                    "legacy_label": {"versioning": [{"enabled": False}]},
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = json.dumps(configuration, indent=2)
+            (Path(temp_dir) / "storage.tf.json").write_text(source)
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("S3 bucket versioning is suspended", stdout)
+        self.assertIn("S3 bucket versioning is explicitly disabled", stdout)
+        self.assertIn("S3 versioning check incomplete", stdout)
+        self.assertIn("live bucket state were not assessed", stdout)
+        self.assertNotIn("hidden_label", stdout)
+        self.assertNotIn("legacy_label", stdout)
+        self.assertNotIn("hidden_status", stdout)
+
+    def test_terraform_analyze_flags_suspended_s3_versioning_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "storage.tf").write_text(
+                'resource "aws_s3_bucket_versioning" "hidden_label" {\n'
+                '  bucket = "example"\n'
+                '  versioning_configuration {\n'
+                '    status = "Suspended"\n'
+                '  }\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("S3 bucket versioning is suspended", stdout)
+        self.assertIn("file: storage.tf, line: 4", stdout)
+        self.assertNotIn("hidden_label", stdout)
+        self.assertNotIn("S3 versioning check incomplete", stdout)
+
+    def test_terraform_analyze_flags_explicitly_unencrypted_ebs_volumes(self):
+        configuration = {
+            "resource": {
+                "aws_ebs_volume": {
+                    "hidden_unencrypted_label": {"encrypted": False},
+                    "encrypted_label": {"encrypted": True},
+                    "dynamic_label": {"encrypted": "${var.hidden_value}"},
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = json.dumps(configuration, indent=2)
+            (Path(temp_dir) / "main.tf.json").write_text(source)
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("aws_ebs_volume explicitly sets encrypted = false", stdout)
+        encrypted_line = next(
+            index for index, line in enumerate(source.splitlines(), start=1)
+            if '"encrypted": false' in line
+        )
+        self.assertIn(f"file: main.tf.json, line: {encrypted_line})", stdout)
+        self.assertIn("EBS encryption check incomplete", stdout)
+        self.assertIn("Account-level EBS encryption by default may override", stdout)
+        self.assertNotIn("hidden_unencrypted_label", stdout)
+        self.assertNotIn("hidden_value", stdout)
+
+    def test_terraform_analyze_flags_explicitly_unencrypted_ebs_volumes_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "storage.tf").write_text(
+                'resource "aws_ebs_volume" "hidden_label" {\n'
+                '  availability_zone = "us-east-1a"\n'
+                '  size               = 10\n'
+                '  encrypted          = false\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("aws_ebs_volume explicitly sets encrypted = false", stdout)
+        self.assertIn("file: storage.tf, line: 4", stdout)
+        self.assertNotIn("hidden_label", stdout)
+        self.assertNotIn("EBS encryption check incomplete", stdout)
+
+    def test_terraform_analyze_flags_unencrypted_instance_block_devices(self):
+        configuration = {
+            "resource": {
+                "aws_instance": {
+                    "hidden_instance_label": {
+                        "root_block_device": [{"encrypted": False}],
+                        "ebs_block_device": [
+                            {"encrypted": True},
+                            {"encrypted": "${var.hidden_encryption}"},
+                        ],
+                    }
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "main.tf.json").write_text(json.dumps(configuration))
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("aws_instance.root_block_device explicitly sets encrypted = false", stdout)
+        self.assertIn("file: main.tf.json", stdout)
+        self.assertIn("EBS encryption check incomplete", stdout)
+        self.assertNotIn("hidden_instance_label", stdout)
+        self.assertNotIn("hidden_encryption", stdout)
+
+    def test_terraform_analyze_flags_unencrypted_instance_block_devices_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "instance.tf").write_text(
+                'resource "aws_instance" "hidden_label" {\n'
+                '  root_block_device {\n'
+                '    encrypted = false\n'
+                '  }\n'
+                '  ebs_block_device {\n'
+                '    encrypted = true\n'
+                '  }\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("aws_instance.root_block_device explicitly sets encrypted = false", stdout)
+        self.assertIn("file: instance.tf, line: 3", stdout)
+        self.assertNotIn("hidden_label", stdout)
+        self.assertNotIn("EBS encryption check incomplete", stdout)
+
+    def test_terraform_analyze_flags_unencrypted_launch_template_volumes(self):
+        configuration = {
+            "resource": {
+                "aws_launch_template": {
+                    "hidden_template_label": {
+                        "block_device_mappings": [
+                            {"ebs": [{"encrypted": False}]},
+                            {"ebs": [{"encrypted": "${var.hidden_encryption}"}]},
+                        ]
+                    }
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "main.tf.json").write_text(json.dumps(configuration))
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "aws_launch_template.block_device_mappings.ebs explicitly sets encrypted = false",
+            stdout,
+        )
+        self.assertIn("file: main.tf.json", stdout)
+        self.assertIn("EBS encryption check incomplete", stdout)
+        self.assertNotIn("hidden_template_label", stdout)
+        self.assertNotIn("hidden_encryption", stdout)
+
+    def test_terraform_analyze_flags_unencrypted_launch_template_volumes_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "launch-template.tf").write_text(
+                'resource "aws_launch_template" "hidden_label" {\n'
+                '  block_device_mappings {\n'
+                '    device_name = "/dev/sdh"\n'
+                '    ebs {\n'
+                '      encrypted = false\n'
+                '    }\n'
+                '  }\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "aws_launch_template.block_device_mappings.ebs explicitly sets encrypted = false",
+            stdout,
+        )
+        self.assertIn("file: launch-template.tf, line: 5", stdout)
+        self.assertNotIn("hidden_label", stdout)
+        self.assertNotIn("EBS encryption check incomplete", stdout)
+
+    def test_terraform_analyze_flags_optional_imdsv2_settings(self):
+        configuration = {
+            "resource": {
+                "aws_instance": {
+                    "hidden_instance_label": {
+                        "metadata_options": [{"http_tokens": "optional"}]
+                    },
+                    "required_instance": {
+                        "metadata_options": [{"http_tokens": "required"}]
+                    },
+                },
+                "aws_launch_template": {
+                    "hidden_template_label": {
+                        "metadata_options": [{"http_tokens": "optional"}]
+                    },
+                    "dynamic_template": {
+                        "metadata_options": [{"http_tokens": "${var.hidden_tokens}"}]
+                    },
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = json.dumps(configuration, indent=2)
+            (Path(temp_dir) / "main.tf.json").write_text(source)
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential IMDSv1 allowed: aws_instance sets", stdout)
+        self.assertIn("Potential IMDSv1 allowed: aws_launch_template sets", stdout)
+        optional_lines = [
+            index for index, line in enumerate(source.splitlines(), start=1)
+            if '"http_tokens": "optional"' in line
+        ]
+        for line in optional_lines:
+            self.assertIn(f"file: main.tf.json, line: {line})", stdout)
+        self.assertIn("IMDS token setting check incomplete", stdout)
+        self.assertNotIn("hidden_instance_label", stdout)
+        self.assertNotIn("hidden_template_label", stdout)
+        self.assertNotIn("hidden_tokens", stdout)
+
+    def test_terraform_analyze_flags_optional_imdsv2_settings_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "compute.tf").write_text(
+                'resource "aws_instance" "hidden_instance" {\n'
+                '  metadata_options {\n'
+                '    http_tokens = "optional"\n'
+                '  }\n'
+                '}\n'
+                'resource "aws_launch_template" "hidden_template" {\n'
+                '  metadata_options {\n'
+                '    http_tokens = "required"\n'
+                '  }\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential IMDSv1 allowed: aws_instance sets", stdout)
+        self.assertIn("file: compute.tf, line: 3", stdout)
+        self.assertNotIn("Potential IMDSv1 allowed: aws_launch_template", stdout)
+        self.assertNotIn("hidden_instance", stdout)
+        self.assertNotIn("IMDS token setting check incomplete", stdout)
+
+    def test_terraform_analyze_flags_explicit_public_rds_access_and_hides_values(self):
+        configuration = {
+            "resource": {
+                "aws_db_instance": {
+                    "private_label": {"publicly_accessible": False},
+                    "public_label": {"publicly_accessible": True},
+                    "dynamic_label": {"publicly_accessible": "${var.private_setting}"},
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = json.dumps(configuration, indent=2)
+            (Path(temp_dir) / "database.tf.json").write_text(source)
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential publicly accessible RDS configuration", stdout)
+        self.assertIn("requests public accessibility", stdout)
+        self.assertIn("reachability also depends on subnet routing and network rules", stdout)
+        public_line = next(
+            index for index, line in enumerate(source.splitlines(), start=1)
+            if '"publicly_accessible": true' in line
+        )
+        self.assertIn(f"file: database.tf.json, line: {public_line})", stdout)
+        self.assertIn("RDS public-access check incomplete", stdout)
+        self.assertNotIn("private_label", stdout)
+        self.assertNotIn("public_label", stdout)
+        self.assertNotIn("private_setting", stdout)
+
+    def test_terraform_analyze_flags_explicit_public_rds_access_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "database.tf").write_text(
+                'resource "aws_db_instance" "hidden_public_label" {\n'
+                '  publicly_accessible = true\n'
+                '}\n'
+                'resource "aws_db_instance" "hidden_private_label" {\n'
+                '  publicly_accessible = false\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential publicly accessible RDS configuration", stdout)
+        self.assertIn("file: database.tf, line: 2", stdout)
+        self.assertNotIn("hidden_public_label", stdout)
+        self.assertNotIn("hidden_private_label", stdout)
+
+    def test_terraform_analyze_flags_explicit_unencrypted_rds_storage(self):
+        configuration = {
+            "resource": {
+                "aws_db_instance": {
+                    "private_label": {"storage_encrypted": True},
+                    "unencrypted_label": {"storage_encrypted": False},
+                    "dynamic_label": {"storage_encrypted": "${var.hidden_encryption}"},
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = json.dumps(configuration, indent=2)
+            (Path(temp_dir) / "database.tf.json").write_text(source)
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential unencrypted RDS storage: aws_db_instance", stdout)
+        self.assertIn("cross-region read-replica behavior may differ", stdout)
+        self.assertIn("RDS storage-encryption check incomplete", stdout)
+        unencrypted_line = next(
+            index for index, line in enumerate(source.splitlines(), start=1)
+            if '"storage_encrypted": false' in line
+        )
+        self.assertIn(f"file: database.tf.json, line: {unencrypted_line})", stdout)
+        self.assertNotIn("unencrypted_label", stdout)
+        self.assertNotIn("hidden_encryption", stdout)
+
+    def test_terraform_analyze_flags_explicit_unencrypted_rds_storage_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "database.tf").write_text(
+                'resource "aws_db_instance" "hidden_label" {\n'
+                '  storage_encrypted = false\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential unencrypted RDS storage", stdout)
+        self.assertIn("file: database.tf, line: 2", stdout)
+        self.assertNotIn("hidden_label", stdout)
+
+    def test_terraform_analyze_flags_explicitly_disabled_rds_deletion_protection(self):
+        configuration = {
+            "resource": {
+                "aws_db_instance": {
+                    "protected_label": {"deletion_protection": True},
+                    "disabled_label": {"deletion_protection": False},
+                    "dynamic_label": {"deletion_protection": "${var.hidden_protection}"},
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = json.dumps(configuration, indent=2)
+            (Path(temp_dir) / "database.tf.json").write_text(source)
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential RDS deletion protection disabled", stdout)
+        self.assertIn("AWS permissions are still required", stdout)
+        self.assertIn("RDS deletion-protection check incomplete", stdout)
+        protection_line = next(
+            index for index, line in enumerate(source.splitlines(), start=1)
+            if '"deletion_protection": false' in line
+        )
+        self.assertIn(f"file: database.tf.json, line: {protection_line})", stdout)
+        self.assertNotIn("disabled_label", stdout)
+        self.assertNotIn("hidden_protection", stdout)
+
+    def test_terraform_analyze_flags_disabled_rds_deletion_protection_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "database.tf").write_text(
+                'resource "aws_db_instance" "hidden_label" {\n'
+                '  deletion_protection = false\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential RDS deletion protection disabled", stdout)
+        self.assertIn("file: database.tf, line: 2", stdout)
+        self.assertNotIn("hidden_label", stdout)
+
+    def test_terraform_analyze_flags_rds_skipping_final_snapshot(self):
+        configuration = {
+            "resource": {
+                "aws_db_instance": {
+                    "snapshot_enabled": {"skip_final_snapshot": False},
+                    "snapshot_skipped": {"skip_final_snapshot": True},
+                    "dynamic_label": {"skip_final_snapshot": "${var.hidden_snapshot_setting}"},
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = json.dumps(configuration, indent=2)
+            (Path(temp_dir) / "database.tf.json").write_text(source)
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential RDS final snapshot skipped", stdout)
+        self.assertIn("no final snapshot is requested", stdout)
+        self.assertIn("RDS final-snapshot check incomplete", stdout)
+        snapshot_line = next(
+            index for index, line in enumerate(source.splitlines(), start=1)
+            if '"skip_final_snapshot": true' in line
+        )
+        self.assertIn(f"file: database.tf.json, line: {snapshot_line})", stdout)
+        self.assertNotIn("snapshot_skipped", stdout)
+        self.assertNotIn("hidden_snapshot_setting", stdout)
+
+    def test_terraform_analyze_flags_rds_skipping_final_snapshot_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "database.tf").write_text(
+                'resource "aws_db_instance" "hidden_label" {\n'
+                '  skip_final_snapshot = true\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential RDS final snapshot skipped", stdout)
+        self.assertIn("file: database.tf, line: 2", stdout)
+        self.assertNotIn("hidden_label", stdout)
+
+    def test_terraform_analyze_flags_zero_rds_backup_retention(self):
+        configuration = {
+            "resource": {
+                "aws_db_instance": {
+                    "backup_enabled": {"backup_retention_period": 7},
+                    "backup_disabled": {"backup_retention_period": 0},
+                    "dynamic_label": {"backup_retention_period": "${var.hidden_retention}"},
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = json.dumps(configuration, indent=2)
+            (Path(temp_dir) / "database.tf.json").write_text(source)
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential RDS automated backups disabled", stdout)
+        self.assertIn("AWS Backup plans and other snapshots were not assessed", stdout)
+        self.assertIn("RDS automated-backup check incomplete", stdout)
+        retention_line = next(
+            index for index, line in enumerate(source.splitlines(), start=1)
+            if '"backup_retention_period": 0' in line
+        )
+        self.assertIn(f"file: database.tf.json, line: {retention_line})", stdout)
+        self.assertNotIn("backup_disabled", stdout)
+        self.assertNotIn("hidden_retention", stdout)
+
+    def test_terraform_analyze_flags_zero_rds_backup_retention_in_hcl(self):
+        try:
+            cli.importlib.import_module("hcl2")
+        except ImportError:
+            self.skipTest("optional python-hcl2 extra is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "database.tf").write_text(
+                'resource "aws_db_instance" "hidden_label" {\n'
+                '  backup_retention_period = 0\n'
+                '}\n'
+            )
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Potential RDS automated backups disabled", stdout)
+        self.assertIn("file: database.tf, line: 2", stdout)
+        self.assertNotIn("hidden_label", stdout)
+
+    def test_terraform_explanation_context_sanitizes_public_rds_finding(self):
+        report = (
+            "Potential publicly accessible RDS configuration: aws_db_instance sets "
+            "publicly_accessible = true. This requests public accessibility; "
+            "reachability also depends on subnet routing and network rules. "
+            "Static analysis did not inspect deployed state. (file: private.tf, "
+            "line: 7)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("publicly_accessible=true", context)
+        self.assertIn("reachability depends on subnet routing and network rules", context)
+        self.assertNotIn("private.tf", context)
+
+    def test_terraform_explanation_context_sanitizes_unencrypted_rds_finding(self):
+        report = (
+            "Potential unencrypted RDS storage: aws_db_instance explicitly sets "
+            "storage_encrypted = false. This is a static configuration finding; "
+            "cross-region read-replica behavior may differ, and deployed encryption "
+            "was not checked. (file: private.tf, line: 3)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("storage_encrypted=false", context)
+        self.assertIn("deployed encryption was not checked", context)
+        self.assertNotIn("private.tf", context)
+
+    def test_terraform_explanation_context_sanitizes_rds_deletion_protection(self):
+        report = (
+            "Potential RDS deletion protection disabled: aws_db_instance explicitly "
+            "sets deletion_protection = false. AWS permissions are still required "
+            "to delete a database; live settings were not checked. "
+            "(file: private.tf, line: 3)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("deletion_protection=false", context)
+        self.assertIn("AWS permissions are still required", context)
+        self.assertNotIn("private.tf", context)
+
+    def test_terraform_explanation_context_sanitizes_rds_final_snapshot_finding(self):
+        report = (
+            "Potential RDS final snapshot skipped: aws_db_instance explicitly sets "
+            "skip_final_snapshot = true. If Terraform later deletes this instance, "
+            "no final snapshot is requested; other backups were not assessed. "
+            "(file: private.tf, line: 3)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("skip_final_snapshot=true", context)
+        self.assertIn("would not request a final snapshot", context)
+        self.assertNotIn("private.tf", context)
+
+    def test_terraform_explanation_context_sanitizes_rds_automated_backup_finding(self):
+        report = (
+            "Potential RDS automated backups disabled: aws_db_instance explicitly "
+            "sets backup_retention_period = 0. This disables RDS automated backups "
+            "where the setting applies; AWS Backup plans and other snapshots were "
+            "not assessed. (file: private.tf, line: 3)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("backup_retention_period=0", context)
+        self.assertIn("AWS Backup plans and other snapshots were not assessed", context)
+        self.assertNotIn("private.tf", context)
 
     def test_terraform_analyze_finds_public_ingress_in_parsed_hcl(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -368,6 +1159,9 @@ class CliTests(unittest.TestCase):
         self.assertIn("protocol tcp, ports 443-443", stdout)
         self.assertIn("protocol udp, ports 53-53", stdout)
         self.assertIn("protocol -1 (all protocols; all ports)", stdout)
+        self.assertIn("file: main.tf, line: 6", stdout)
+        self.assertIn("file: main.tf, line: 14)", stdout)
+        self.assertIn("file: main.tf, line: 27)", stdout)
         for label in ("hidden_label", "legacy_label", "egress_label", "modern_label"):
             self.assertNotIn(label, stdout)
 
@@ -478,6 +1272,15 @@ class CliTests(unittest.TestCase):
         self.assertIn("Terraform configuration files analyzed: 0/1", stdout)
         self.assertNotIn("PRIVATE_VALUE", stdout)
         self.assertNotIn('"token"', stdout)
+
+    def test_terraform_analyze_summarizes_valid_json_with_non_object_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "main.tf.json").write_text("[]\n")
+            code, stdout, _ = self.run_captured(cli.terraform_analyze, temp_dir)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Could not summarize main.tf.json", stdout)
+        self.assertNotIn("Could not parse", stdout)
 
     def test_terraform_analyze_suppresses_parser_errors(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -657,6 +1460,436 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("does not exist", stderr)
         which.assert_not_called()
+
+    def test_github_actions_check_flags_write_all_without_printing_workflow_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workflows = Path(temp_dir) / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            (workflows / "ci.yml").write_text(
+                "name: CI\n"
+                "permissions: write-all # broad access\n"
+                "jobs:\n"
+                "  build:\n"
+                "    steps:\n"
+                "      - run: |\n"
+                "          permissions: write-all\n"
+                "          echo private_workflow_detail\n"
+                "# permissions: write-all\n"
+            )
+            code, stdout, stderr = self.run_captured(cli.main, ["github-actions-check", temp_dir])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "")
+        self.assertIn("ci.yml at line 2", stdout)
+        self.assertNotIn("private_workflow_detail", stdout)
+        self.assertNotIn("line 8", stdout)
+
+    def test_github_actions_check_reports_no_workflows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            code, stdout, _ = self.run_captured(cli.github_actions_check, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("No GitHub Actions workflow directory found", stdout)
+
+    def test_github_actions_check_rejects_missing_directory(self):
+        code, _, stderr = self.run_captured(cli.github_actions_check, "/path/does/not/exist")
+        self.assertEqual(code, 2)
+        self.assertIn("does not exist", stderr)
+
+    def test_dockerfile_check_flags_implicit_and_explicit_latest_without_echoing_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "Dockerfile").write_text(
+                "FROM registry.example:5000/team/app:latest AS build\n"
+                "RUN echo private_build_detail\n"
+                "FROM ubuntu AS runtime\n"
+                "FROM scratch\n"
+                "FROM team/app:latest@sha256:0123456789abcdef\n"
+                "FROM alpine:3.20\n"
+            )
+            code, stdout, stderr = self.run_captured(cli.main, ["dockerfile-check", temp_dir])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "")
+        self.assertIn("Dockerfiles checked: 1", stdout)
+        self.assertIn("Dockerfile at line 1: uses the explicit latest tag", stdout)
+        self.assertIn("Dockerfile at line 3: uses the implicit latest tag", stdout)
+        self.assertNotIn("private_build_detail", stdout)
+        self.assertNotIn("line 5", stdout)
+        self.assertNotIn("line 6", stdout)
+
+    def test_dockerfile_check_marks_variable_image_references_incomplete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "Dockerfile.dev").write_text(
+                "ARG BASE_IMAGE\nFROM ${BASE_IMAGE} AS app\n"
+            )
+            code, stdout, _ = self.run_captured(cli.dockerfile_check, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("check incomplete", stdout)
+        self.assertNotIn("BASE_IMAGE", stdout)
+
+    def test_dockerfile_check_reports_no_files_and_missing_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            code, stdout, _ = self.run_captured(cli.dockerfile_check, temp_dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("No visible Dockerfiles found", stdout)
+        code, _, stderr = self.run_captured(cli.dockerfile_check, "/path/does/not/exist")
+        self.assertEqual(code, 2)
+        self.assertIn("does not exist", stderr)
+
+    def test_project_review_runs_all_local_checks_and_reports_partial_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.object(cli, "terraform_analyze", return_value=1) as terraform, \
+                patch.object(cli, "github_actions_check", return_value=0) as actions, \
+                patch.object(cli, "dockerfile_check", return_value=0) as docker:
+            code, stdout, _ = self.run_captured(cli.project_review, temp_dir)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Terraform analysis:", stdout)
+        self.assertIn("GitHub Actions check:", stdout)
+        self.assertIn("Dockerfile check:", stdout)
+        self.assertIn("one or more incomplete or failed checks", stdout)
+        terraform.assert_called_once_with(temp_dir)
+        actions.assert_called_once_with(temp_dir)
+        docker.assert_called_once_with(temp_dir)
+
+    def test_project_review_rejects_missing_directory_before_checks(self):
+        with patch.object(cli, "terraform_analyze") as terraform:
+            code, _, stderr = self.run_captured(cli.project_review, "/path/does/not/exist")
+
+        self.assertEqual(code, 2)
+        self.assertIn("does not exist", stderr)
+        terraform.assert_not_called()
+
+    def test_aws_security_groups_reports_public_ingress_without_sensitive_values(self):
+        response = {
+            "SecurityGroupRules": [
+                {"IsEgress": False, "CidrIpv4": "0.0.0.0/0", "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+                 "GroupId": "sg-private-id", "Description": "private-description"},
+                {"IsEgress": False, "CidrIpv6": "::/0", "IpProtocol": "-1"},
+                {"IsEgress": True, "CidrIpv4": "0.0.0.0/0", "IpProtocol": "-1"},
+                {"IsEgress": False, "CidrIpv4": "10.0.0.0/8", "IpProtocol": "tcp"},
+            ]
+        }
+        result = subprocess.CompletedProcess(
+            args=["aws"], returncode=0, stdout=json.dumps(response), stderr=""
+        )
+        with patch.object(cli.shutil, "which", return_value="/fake/aws"), \
+                patch.object(cli.subprocess, "run", return_value=result) as run:
+            code, stdout, stderr = self.run_captured(cli.aws_security_groups, "us-east-1")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("region us-east-1", stdout)
+        self.assertIn("0.0.0.0/0 (protocol tcp, ports 443-443)", stdout)
+        self.assertIn("::/0 (protocol -1 (all protocols; all ports))", stdout)
+        self.assertNotIn("sg-private-id", stdout)
+        self.assertNotIn("private-description", stdout)
+        self.assertEqual(run.call_args.args[0][-2:], ["--region", "us-east-1"])
+
+    def test_aws_security_groups_suppresses_aws_errors_and_invalid_json(self):
+        cases = (
+            subprocess.CompletedProcess(args=["aws"], returncode=1, stdout="", stderr="private error"),
+            subprocess.CompletedProcess(args=["aws"], returncode=0, stdout="private response", stderr=""),
+        )
+        for result in cases:
+            with self.subTest(result=result.returncode, output=result.stdout), \
+                    patch.object(cli.shutil, "which", return_value="/fake/aws"), \
+                    patch.object(cli.subprocess, "run", return_value=result):
+                code, stdout, stderr = self.run_captured(cli.aws_security_groups)
+            self.assertEqual(code, 1)
+            self.assertNotIn("private", stdout + stderr)
+
+    def test_aws_security_groups_handles_missing_cli(self):
+        with patch.object(cli.shutil, "which", return_value=None):
+            code, _, stderr = self.run_captured(cli.aws_security_groups)
+        self.assertEqual(code, 1)
+        self.assertIn("AWS CLI is not installed", stderr)
+
+    def test_ask_uses_only_local_ollama_and_prints_answer(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {"message": {"content": "Terraform state records managed resources."}}
+        ).encode("utf-8")
+        opener = MagicMock()
+        opener.open.return_value = response
+        with patch.object(cli, "build_opener", return_value=opener) as build_opener:
+            code, stdout, stderr = self.run_captured(
+                cli.ask_local_model, "Explain this finding", "llama3", "Static check saw a public rule."
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout, "Terraform state records managed resources.\n")
+        build_opener.assert_called_once()
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "http://localhost:11434/api/chat")
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["model"], "llama3")
+        self.assertFalse(payload["stream"])
+        self.assertIn("Explain this finding", payload["messages"][-1]["content"])
+        self.assertIn("Static check saw a public rule.", payload["messages"][-1]["content"])
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 180)
+
+    def test_terraform_draft_passes_bounded_requirements_to_local_model(self):
+        with patch.object(cli, "ask_local_model", return_value=0) as ask:
+            code, stdout, stderr = self.run_captured(
+                cli.terraform_draft, "Create a private S3 bucket", "llama3"
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("Unreviewed Terraform draft", stdout)
+        self.assertIn("not written, validated, or applied", stdout)
+        ask.assert_called_once()
+        question, model = ask.call_args.args
+        self.assertEqual(question, "Create a private S3 bucket")
+        self.assertEqual(model, "llama3")
+        self.assertIn("Return HCL only", ask.call_args.kwargs["system_instruction"])
+        self.assertIn(
+            "comment immediately before each top-level block",
+            ask.call_args.kwargs["system_instruction"],
+        )
+        self.assertEqual(ask.call_args.kwargs["max_output_tokens"], 1200)
+
+    def test_terraform_draft_rejects_empty_or_oversized_requirements(self):
+        with patch.object(cli, "ask_local_model") as ask:
+            empty_code, _, empty_stderr = self.run_captured(cli.terraform_draft, "  ")
+            long_code, _, long_stderr = self.run_captured(cli.terraform_draft, "x" * 5001)
+
+        self.assertEqual(empty_code, 2)
+        self.assertIn("Please describe", empty_stderr)
+        self.assertEqual(long_code, 2)
+        self.assertIn("under 5,000 characters", long_stderr)
+        ask.assert_not_called()
+
+    def test_terraform_draft_saves_to_new_tf_file(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {"message": {"content": 'resource "example" "sample" {}'}}
+        ).encode("utf-8")
+        opener = MagicMock()
+        opener.open.return_value = response
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "main.tf"
+            with patch.object(cli, "build_opener", return_value=opener):
+                code, stdout, stderr = self.run_captured(
+                    cli.terraform_draft,
+                    "Create a resource",
+                    "llama3",
+                    str(target),
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(target.read_text(encoding="utf-8"), 'resource "example" "sample" {}\n')
+            self.assertIn("saved to:", stdout)
+            self.assertIn("not been formatted, validated, or applied", stdout)
+
+    def test_terraform_draft_refuses_existing_file_without_changing_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "main.tf"
+            target.write_text("keep this file\n", encoding="utf-8")
+            with patch.object(cli, "ask_local_model") as ask:
+                code, _, stderr = self.run_captured(
+                    cli.terraform_draft,
+                    "Create a resource",
+                    "llama3",
+                    str(target),
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), "keep this file\n")
+
+        self.assertEqual(code, 2)
+        self.assertIn("already exists", stderr)
+        ask.assert_not_called()
+
+    def test_terraform_draft_requires_tf_extension_for_output(self):
+        with patch.object(cli, "ask_local_model") as ask:
+            code, _, stderr = self.run_captured(
+                cli.terraform_draft, "Create a resource", "llama3", "draft.txt"
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("end in .tf", stderr)
+        ask.assert_not_called()
+
+    def test_terraform_explain_sends_only_sanitized_static_findings(self):
+        configuration = {
+            "terraform": {"required_version": ">= 1.0"},
+            "resource": {
+                "aws_security_group": {
+                    "private-network-resource-label": {
+                        "ingress": [{
+                            "protocol": "tcp", "from_port": 443, "to_port": 443,
+                            "cidr_blocks": ["0.0.0.0/0"],
+                        }],
+                        "tags": {"Name": "private-user-data-value"},
+                    }
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "internal-network.tf.json").write_text(json.dumps(configuration))
+            with patch.object(cli, "ask_local_model", return_value=0) as ask:
+                code, stdout, stderr = self.run_captured(
+                    cli.terraform_explain, temp_dir, "llama3"
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("Potential public ingress", stdout)
+        self.assertIn("AI explanation (generated from the static findings above)", stdout)
+        ask.assert_called_once()
+        question, model = ask.call_args.args[:2]
+        context = ask.call_args.kwargs["context"]
+        self.assertEqual(model, "llama3")
+        self.assertIn("aws_security_group", context)
+        self.assertIn("0.0.0.0/0", context)
+        self.assertNotIn("internal-network.tf.json", context)
+        for private_value in ("private-network-resource-label", "private-user-data-value"):
+            self.assertNotIn(private_value, context)
+        self.assertNotIn("destroy", question.lower())
+
+    def test_terraform_explanation_context_sanitizes_s3_acl_finding(self):
+        report = (
+            "Potential public S3 ACL: aws_s3_bucket_acl uses public-read. "
+            "This static finding does not confirm effective public access; "
+            "bucket or account Block Public Access settings may override it. "
+            "(file: private-user-data.tf)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("aws_s3_bucket_acl", context)
+        self.assertIn("public-read", context)
+        self.assertIn("effective access is unverified", context)
+        self.assertNotIn("private-user-data.tf", context)
+
+    def test_terraform_explanation_context_sanitizes_s3_block_finding(self):
+        report = (
+            "S3 public-access protection disabled: "
+            "aws_s3_bucket_public_access_block sets block_public_policy = false. "
+            "This is a configuration finding. (file: private.tf)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("block_public_policy", context)
+        self.assertIn("effective public access", context)
+        self.assertNotIn("private.tf", context)
+
+    def test_terraform_explanation_context_sanitizes_s3_versioning_finding(self):
+        report = (
+            "Potential S3 versioning disabled: S3 bucket versioning is suspended; "
+            "new object writes do not get unique versions. Existing versions and "
+            "live bucket state were not assessed. (file: private.tf)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("suspended", context)
+        self.assertIn("live bucket state is unverified", context)
+        self.assertNotIn("private.tf", context)
+
+    def test_terraform_explanation_context_sanitizes_ebs_encryption_finding(self):
+        report = (
+            "Potential unencrypted EBS volume setting: aws_ebs_volume explicitly "
+            "sets encrypted = false. Account-level settings may override it. "
+            "(file: private.tf)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("aws_ebs_volume", context)
+        self.assertIn("encrypted=false", context)
+        self.assertIn("deployed encryption was not checked", context)
+        self.assertNotIn("private.tf", context)
+
+    def test_terraform_explanation_context_allows_supported_instance_block_types(self):
+        report = (
+            "Potential unencrypted EBS volume setting: "
+            "aws_instance.root_block_device explicitly sets encrypted = false. "
+            "Account-level defaults may override this."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("aws_instance.root_block_device", context)
+        self.assertIn("encrypted=false", context)
+
+    def test_terraform_explanation_context_allows_launch_template_block_type(self):
+        report = (
+            "Potential unencrypted EBS volume setting: "
+            "aws_launch_template.block_device_mappings.ebs explicitly sets "
+            "encrypted = false. Account-level defaults may override this."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("aws_launch_template.block_device_mappings.ebs", context)
+        self.assertIn("encrypted=false", context)
+
+    def test_terraform_explanation_context_sanitizes_optional_imdsv2_finding(self):
+        report = (
+            "Potential IMDSv1 allowed: aws_instance sets http_tokens = optional. "
+            "(file: sensitive.tf, label: private_instance)."
+        )
+
+        context = cli.safe_terraform_explanation_context(report)
+
+        self.assertIn("http_tokens=optional", context)
+        self.assertIn("allows IMDSv1 compatibility", context)
+        self.assertNotIn("sensitive.tf", context)
+        self.assertNotIn("private_instance", context)
+
+    def test_terraform_explain_does_not_send_unresolved_cidr_values(self):
+        configuration = {
+            "resource": {
+                "aws_security_group": {
+                    "web": {"ingress": [{
+                        "protocol": "tcp", "cidr_blocks": ["${var.sensitive_cidr}"],
+                    }]}
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "main.tf.json").write_text(json.dumps(configuration))
+            with patch.object(cli, "ask_local_model", return_value=0) as ask:
+                code, _, _ = self.run_captured(cli.terraform_explain, temp_dir)
+
+        self.assertEqual(code, 0)
+        context = ask.call_args.kwargs["context"]
+        self.assertIn("check is incomplete", context)
+        self.assertNotIn("sensitive_cidr", context)
+
+    def test_terraform_explain_skips_ai_when_static_analysis_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "broken.tf.json").write_text("{")
+            with patch.object(cli, "ask_local_model") as ask:
+                code, stdout, _ = self.run_captured(cli.terraform_explain, temp_dir)
+
+        self.assertEqual(code, 1)
+        self.assertIn("AI explanation skipped", stdout)
+        ask.assert_not_called()
+
+    def test_ask_suppresses_local_service_errors(self):
+        with patch.object(cli, "build_opener", side_effect=URLError("private details")):
+            code, stdout, stderr = self.run_captured(cli.ask_local_model, "Explain Terraform")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("local Ollama service", stderr)
+        self.assertNotIn("private details", stderr)
+
+    def test_ask_rejects_blank_question_without_contacting_local_service(self):
+        with patch.object(cli, "build_opener") as build_opener:
+            code, _, stderr = self.run_captured(cli.ask_local_model, "  ")
+
+        self.assertEqual(code, 2)
+        self.assertIn("enter a question", stderr)
+        build_opener.assert_not_called()
 
     def test_git_status_filters_sensitive_entries(self):
         output = (

@@ -54,7 +54,170 @@ service or API costs, not developer time.
 - **Timing:** Completed; the new `status` command reuses the safe project
   summary and does not invoke external tools.
 
+### Completed: combine the local Terraform checks in one command
+
+- **Priority:** High value.
+- **Problem:** Beginners had to remember and run separate Terraform check and
+  static-analysis commands.
+- **Who benefits:** Developers reviewing a module or a generated draft.
+- **Difficulty:** Low; it reuses existing checks without new dependencies.
+- **Running/API cost:** None; it runs locally.
+- **Dependencies and risks:** Validation runs only in initialized directories;
+  the command does not initialize, plan, or change infrastructure.
+- **Timing:** Implemented as `terraform-review`; tests cover failure reporting
+  and continuing static analysis when tool checks fail. An opt-in `--explain`
+  flag also uses local Ollama with sanitized findings only; live explanation
+  behavior still needs confirmation in the user's Terminal.
+
+### Completed: flag explicit public S3 canned ACLs in Terraform
+
+- **Priority:** High value.
+- **Problem:** Public canned ACLs can grant anonymous read or write access to
+  S3 bucket/object data.
+- **Who benefits:** Developers reviewing Terraform storage configuration.
+- **Difficulty:** Medium; HCL parsing and JSON handling must avoid evaluating
+  expressions or printing private values.
+- **Running/API cost:** None; analysis runs locally.
+- **Dependencies and risks:** This narrow rule only checks literal
+  `public-read` and `public-read-write` values in supported bucket and object
+  resources. It does not analyze bucket policies or grants, and effective
+  access may be overridden by Block Public Access settings.
+- **Timing:** Implemented for HCL and Terraform JSON. Tests cover both formats,
+  dynamic ACL suppression, and sanitized AI context.
+
+### Completed: flag explicitly disabled bucket-level S3 protections
+
+- **Priority:** High value.
+- **Problem:** Explicitly disabling one of the bucket-level public-access
+  protections can weaken a storage configuration.
+- **Who benefits:** Developers reviewing Terraform before deployment.
+- **Difficulty:** Low.
+- **Running/API cost:** None; this is local static analysis.
+- **Dependencies and risks:** Only literal bucket-level settings are checked;
+  account and organization controls may affect effective behavior.
+- **Timing:** Implemented with HCL/JSON tests and sanitized AI summaries.
+
+### Completed: flag explicit unencrypted EBS volume settings
+
+- **Priority:** High value.
+- **Problem:** Terraform may explicitly request an EBS volume without encryption.
+- **Who benefits:** Developers reviewing EC2 storage configuration.
+- **Difficulty:** Low.
+- **Running/API cost:** None; local static analysis.
+- **Dependencies and risks:** The rule checks literal `encrypted = false` on
+  `aws_ebs_volume`, `aws_instance` root/additional EBS blocks, and EBS blocks
+  in `aws_launch_template`. Account-level defaults may override it; deployed
+  volumes are outside the check.
+- **Timing:** Implemented with HCL/JSON tests and sanitized AI explanations.
+
+### Completed: flag optional EC2 metadata tokens
+
+- **Priority:** High value.
+- **Problem:** Token-optional instance metadata can preserve IMDSv1 compatibility.
+- **Who benefits:** Developers reviewing EC2 instance and launch-template
+  security settings.
+- **Difficulty:** Low.
+- **Running/API cost:** None; local static analysis.
+- **Dependencies and risks:** Explicit literal settings only. Account-level
+  settings and launch overrides affect final behavior; the rule makes no live
+  AWS checks.
+- **Timing:** Implemented with HCL/JSON tests and sanitized AI summaries.
+
+### Completed: add safe Terraform source locations to findings
+
+- **Priority:** High value.
+- **Problem:** Security findings are easier to review when users can locate the
+  relevant configuration quickly.
+- **Who benefits:** Developers reviewing Terraform diagnostics and AI explanations.
+- **Difficulty:** Medium; source positions must come from parsed HCL rather than
+  matching arbitrary text.
+- **Running/API cost:** None.
+- **Dependencies and risks:** HCL line numbers come from parser positions, and
+  JSON line numbers come from the standard-library decoder. Sensitive
+  configuration filenames remain hidden.
+- **Timing:** Implemented for supported HCL/JSON checks and covered by regression tests.
+
 ## Future ideas
+
+### Completed: flag explicitly disabled S3 bucket versioning
+
+- **Priority:** High value.
+- **Problem:** Suspended or disabled versioning does not preserve new object
+  versions as a recovery option.
+- **Who benefits:** Developers reviewing Terraform-managed S3 buckets.
+- **Difficulty:** Low; supports current and legacy Terraform resource forms.
+- **Running/API cost:** None; local static analysis only.
+- **Dependencies and risks:** Dynamic settings are marked incomplete. Existing
+  object versions, lifecycle rules, AWS Backup, and live bucket state are not
+  inspected; versioning alone is not a complete backup strategy.
+- **Timing:** Implemented and covered by HCL/JSON tests.
+
+### Flag explicitly public RDS instance settings
+
+- **Priority:** High value.
+- **Problem:** An RDS instance configured for public accessibility can receive
+  public addressing; teams may intend private-only databases.
+- **Who benefits:** Developers reviewing Terraform before deployment.
+- **Difficulty:** Low for explicit literal settings in supported resources.
+- **Running/API cost:** None; the check is local.
+- **Dependencies and risks:** A public-address setting alone does not prove
+  internet reachability; subnet routing and security-group rules also matter.
+  Do not query or change AWS resources.
+- **Timing:** Implemented for literal `aws_db_instance.publicly_accessible =
+  true` in HCL and Terraform JSON, with line references and incomplete status
+  for dynamic values. The same resource check also flags explicit
+  `storage_encrypted = false`, with the cross-region read-replica caveat, and
+  explicit `deletion_protection = false`, without implying deletion bypasses
+  AWS permissions. It also reports `skip_final_snapshot = true` without
+  claiming that other backups are absent, and `backup_retention_period = 0`
+  without assuming AWS Backup plans or other snapshots are absent.
+
+### Add a conservative local GitHub Actions workflow check
+
+- **Priority:** High value.
+- **Problem:** A malformed or overly permissive workflow can waste CI runs or
+  expose repository permissions and secrets.
+- **Who benefits:** Developers reviewing GitHub Actions before pushing.
+- **Difficulty:** Medium; YAML parsing and GitHub's expression syntax need
+  careful handling to avoid misleading results.
+- **Running/API cost:** None for local analysis; no GitHub access is needed.
+- **Dependencies and risks:** Prefer a maintained YAML parser as an optional
+  extra, or limit checks to clearly recognized syntax. Never execute workflow
+  commands or print secret values; static checks cannot prove runtime behavior.
+- **Timing:** Started as `github-actions-check`, which flags only a top-level
+  `permissions: write-all` line. Broader checks are deferred until YAML parsing
+  and GitHub expression handling can be validated reliably.
+
+### Add local Dockerfile safety checks
+
+- **Priority:** High value.
+- **Problem:** Mutable or implicit base-image tags can make builds change
+  unexpectedly over time.
+- **Who benefits:** Developers building or reviewing container images.
+- **Difficulty:** Low for narrow Dockerfile rules; higher for full syntax and
+  build-context validation.
+- **Running/API cost:** None for static local checks.
+- **Dependencies and risks:** Do not execute Docker builds or pull images
+  automatically; distinguish unresolved variable references from verified
+  findings.
+- **Timing:** Started as `dockerfile-check`, which flags implicit or explicit
+  `latest` tags and marks variable image references incomplete. Full Dockerfile
+  parsing and build validation are deferred.
+
+### Combine local checks into one project review
+
+- **Priority:** High value.
+- **Problem:** Users otherwise need to remember separate commands for each
+  supported project type.
+- **Who benefits:** Developers who want one quick local review before sharing
+  or committing a project.
+- **Difficulty:** Low; compose existing read-only checks and preserve each
+  check's exit status.
+- **Running/API cost:** None.
+- **Dependencies and risks:** Avoid adding implicit network, AI, Terraform, or
+  Docker execution to a static review command.
+- **Timing:** Implemented as `project-review`; it runs local Terraform,
+  GitHub Actions, and Dockerfile checks and continues after a check failure.
 
 ### Add more Terraform security rules after validating the current finding
 
@@ -128,14 +291,51 @@ service or API costs, not developer time.
   never read state files or apply changes.
 - **Timing:** Defer until CLI safety and tests are established.
 
-### Optional AI explanation provider
+### Completed: add optional local AI questions
 
-- **Problem:** Static explanations may not cover unfamiliar errors.
-- **Who benefits:** Users troubleshooting complex diagnostic output.
-- **Difficulty:** High.
-- **Running/API cost:** Potential usage-based API charges, or local hardware and
-  maintenance costs.
-- **Dependencies and risks:** Provider choice, secret scrubbing, data minimization,
-  consent, and graceful operation without a provider.
-- **Timing:** Defer until core diagnostics are useful without AI and cost and
-  privacy options can be compared.
+- **Priority:** High value.
+- **Problem:** Static CLI messages cannot answer general DevOps questions.
+- **Who benefits:** Beginners learning cloud and DevOps concepts.
+- **Difficulty:** Medium.
+- **Running/API cost:** No API cost; the user downloads a local model (default
+  download about 1.4 GB) and uses local memory and compute.
+- **Dependencies and risks:** Optional Ollama install and model; answers can be
+  wrong. The current command sends only the question and has no project context.
+- **Timing:** Implemented as `ask`; end-to-end model verification waits on an
+  optional local Ollama install.
+
+### Completed: explain safe Terraform findings with local AI
+
+- **Priority:** High value.
+- **Problem:** `ask` currently cannot see Terraform or AWS findings, so users
+  must copy them into a separate question themselves.
+- **Who benefits:** Beginners who want help interpreting the assistant's own
+  verified outputs.
+- **Difficulty:** Medium.
+- **Running/API cost:** No API cost with Ollama; local compute only.
+- **Dependencies and risks:** Pass only deliberately selected, secret-screened
+  summaries. Keep model explanations separate from verified findings and never
+  let model output execute commands.
+- **Timing:** Implemented as `terraform-explain`. Tests confirm it passes only
+  allowlisted static summaries. A live Ollama run remains to verify from the
+  user's Terminal because the Codex execution environment cannot access the
+  local service.
+
+### Draft Terraform configurations with AI for review
+
+- **Priority:** High value.
+- **Problem:** Beginners need help turning infrastructure requirements into a
+  Terraform starting point.
+- **Who benefits:** Developers learning AWS and infrastructure as code.
+- **Difficulty:** Medium to high; generated configurations need clear scope and
+  reliable validation.
+- **Running/API cost:** No API cost with the local model; local compute only.
+- **Dependencies and risks:** Clearly label generated code as unverified.
+  Optional saving must refuse to overwrite existing files and must never apply
+  infrastructure. Run formatting and validation only when the user asks.
+- **Timing:** Implemented as `terraform-draft`. Offline regression tests cover
+  bounded input, safe prompt requirements, and explicit unverified messaging.
+  Optional saving creates new `.tf` files only. The user confirmed local Ollama
+  returns a draft; manual review and
+  validation remain necessary before using generated HCL. The prompt also asks
+  for a plain-language comment before each top-level block.
